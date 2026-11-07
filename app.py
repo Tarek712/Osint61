@@ -174,8 +174,7 @@ async def generate_ai_military_post(
     compact_prompt = (
         "أنت محلل استخبارات عسكرية (OSINT). صغ منشوراً إخبارياً عسكرياً احترافياً ومختصراً جداً (3 إلى 4 أسطر فقط) "
         "جاهزاً للنشر في قناة تيليجرام عاجلة بناءً على هذه البيانات الخام. "
-        "اذكر اسم المكان الدقيق بوضوح في بداية التحليل، واشرح طبيعة الطائرة ومهمتها الاستخباراتية/العملياتية أو طبيعة الانفجار/الحدث وأهميته التكتيكية بدون أي مقدمات أو حشو:
-"
+        "اذكر اسم المكان الدقيق بوضوح في بداية التحليل، واشرح طبيعة الطائرة ومهمتها الاستخباراتية/العملياتية أو طبيعة الانفجار/الحدث وأهميته التكتيكية بدون أي مقدمات أو حشو:\n"
         f"التصنيف: {category} | الحدث: {title} | الموقع الدقيق: {exact_location} | البيانات: {telemetry_summary}{corr_str}"
     )
 
@@ -482,8 +481,7 @@ async def send_telegram_alert(
     ]
 
     if ai_post_text:
-        msg_parts.append(f"🧠 <b>التحليل العسكري والاستخباراتي:</b>
-{ai_post_text}")
+        msg_parts.append(f"🧠 <b>التحليل العسكري والاستخباراتي:</b>\n{ai_post_text}")
         msg_parts.append("")
     else:
         msg_parts.append(f"<b>الحدث المرصود:</b> {title}")
@@ -502,8 +500,7 @@ async def send_telegram_alert(
     msg_parts.append("━━━━━━━━━━━━━━━━━━━━")
     msg_parts.append(f"⏱ <code>{now_str}</code>")
 
-    text = "
-".join(msg_parts)
+    text = "\n".join(msg_parts)
     # Ensure caption stays within Telegram 1024-char limit
     if len(text) > 1015:
         text = text[:1010] + "..."
