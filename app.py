@@ -1,3 +1,4 @@
+import os
 import asyncio
 import csv
 import io
@@ -17,6 +18,41 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image, ImageDraw, ImageFont
 
 import config
+
+# --- AUTO-HEALING CONFIG DEFAULTS (Protects against outdated config.py on GitHub) ---
+if not hasattr(config, "GEMINI_API_KEY"):
+    config.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+if not hasattr(config, "GEMINI_MODEL"):
+    config.GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+if not hasattr(config, "GEMINI_MODEL_CASCADE"):
+    config.GEMINI_MODEL_CASCADE = [
+        config.GEMINI_MODEL,
+        "gemini-3-flash-lite",
+        "gemini-flash-lite-latest",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash"
+    ]
+if not hasattr(config, "NASA_FIRMS_MAP_KEY"):
+    config.NASA_FIRMS_MAP_KEY = os.getenv("NASA_FIRMS_MAP_KEY", "")
+if not hasattr(config, "POLL_INTERVAL_THERMAL"):
+    config.POLL_INTERVAL_THERMAL = int(os.getenv("POLL_INTERVAL_THERMAL", 300))
+if not hasattr(config, "MIN_FRP_DAY_MW"):
+    config.MIN_FRP_DAY_MW = float(os.getenv("MIN_FRP_DAY_MW", 25.0))
+if not hasattr(config, "MIN_FRP_NIGHT_MW"):
+    config.MIN_FRP_NIGHT_MW = float(os.getenv("MIN_FRP_NIGHT_MW", 12.0))
+if not hasattr(config, "KNOWN_OIL_FLARE_ZONES"):
+    config.KNOWN_OIL_FLARE_ZONES = [
+        {"name": "حقول الأهواز وخوزستان النفطية", "lat": 31.3200, "lon": 48.6800, "radius_km": 45},
+        {"name": "مصفاة عبادان وحقول خرمشهر", "lat": 30.3400, "lon": 48.2900, "radius_km": 28},
+        {"name": "حقول عسلويه وبارس الجنوبي للغاز", "lat": 27.4700, "lon": 52.6100, "radius_km": 35},
+        {"name": "جزيرة خرج النفطية", "lat": 29.2400, "lon": 50.3200, "radius_km": 15},
+        {"name": "حقول الرميلة والقرنة (البصرة)", "lat": 30.5800, "lon": 47.3400, "radius_km": 48},
+        {"name": "حقول كركوك النفطية", "lat": 35.5300, "lon": 44.3200, "radius_km": 30},
+        {"name": "حقول برقان والأحمدي (الكويت)", "lat": 28.9800, "lon": 47.9500, "radius_km": 35},
+        {"name": "حقول الظهران وبقيق والجبيل", "lat": 26.2500, "lon": 49.8000, "radius_km": 50},
+        {"name": "حقول دير الزور والعمر النفطية", "lat": 35.0800, "lon": 40.5600, "radius_km": 22}
+    ]
+
 
 logging.basicConfig(
     level=logging.INFO,
