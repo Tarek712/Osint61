@@ -17,6 +17,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image, ImageDraw, ImageFont
 
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    HAS_ARABIC_SHAPER = True
+except ImportError:
+    HAS_ARABIC_SHAPER = False
+
 import config
 
 # --- AUTO-HEALING CONFIG DEFAULTS (Protects against outdated config.py on GitHub) ---
@@ -24,6 +31,8 @@ if not hasattr(config, "GEMINI_API_KEY"):
     config.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 if not hasattr(config, "GEMINI_MODEL"):
     config.GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+if not hasattr(config, "MAP_WATERMARK_AR"):
+    config.MAP_WATERMARK_AR = os.getenv("MAP_WATERMARK_AR", "خاص بتسريبات الحرب")
 if not hasattr(config, "GEMINI_MODEL_CASCADE"):
     config.GEMINI_MODEL_CASCADE = [
         config.GEMINI_MODEL,
@@ -40,30 +49,89 @@ if not hasattr(config, "MIN_FRP_DAY_MW"):
     config.MIN_FRP_DAY_MW = float(os.getenv("MIN_FRP_DAY_MW", 25.0))
 if not hasattr(config, "MIN_FRP_NIGHT_MW"):
     config.MIN_FRP_NIGHT_MW = float(os.getenv("MIN_FRP_NIGHT_MW", 12.0))
+if not hasattr(config, "ALLOWED_MILITARY_OPERATORS"):
+    config.ALLOWED_MILITARY_OPERATORS = {
+        "USA": {
+            "name_ar": "القوات الجوية/البحرية الأمريكية 🇺🇸 (USAF/USN)",
+            "hex_prefixes": ("AE", "ADF"),
+            "callsign_prefixes": ("HOMER", "FORTE", "JAKE", "PYTHON", "NCHO", "LAGR", "GOLD", "ETHYL", "RCH", "OLIVE", "DOOM", "BONE", "RAIDR", "NAVY", "CNV")
+        },
+        "ISRAEL": {
+            "name_ar": "سلاح الجو الإسرائيلي 🇮🇱 (IAF)",
+            "hex_prefixes": ("738A", "738B"),
+            "callsign_prefixes": ("IAF", "ISD")
+        },
+        "SAUDI_ARABIA": {
+            "name_ar": "القوات الجوية الملكية السعودية 🇸🇦 (RSAF)",
+            "hex_prefixes": ("7102", "7103", "710"),
+            "callsign_prefixes": ("RSAF", "SRG", "TUWAIQ")
+        }
+    }
 if not hasattr(config, "KNOWN_OIL_FLARE_ZONES"):
     config.KNOWN_OIL_FLARE_ZONES = [
+        {"name": "حقول صافر النفطية الروتينية (شرق مأرب)", "lat": 15.5500, "lon": 45.7800, "radius_km": 12},
         {"name": "حقول الأهواز وخوزستان النفطية", "lat": 31.3200, "lon": 48.6800, "radius_km": 45},
         {"name": "مصفاة عبادان وحقول خرمشهر", "lat": 30.3400, "lon": 48.2900, "radius_km": 28},
         {"name": "حقول عسلويه وبارس الجنوبي للغاز", "lat": 27.4700, "lon": 52.6100, "radius_km": 35},
-        {"name": "جزيرة خرج النفطية", "lat": 29.2400, "lon": 50.3200, "radius_km": 15},
-        {"name": "حقول الرميلة والقرنة (البصرة)", "lat": 30.5800, "lon": 47.3400, "radius_km": 48},
-        {"name": "حقول كركوك النفطية", "lat": 35.5300, "lon": 44.3200, "radius_km": 30},
-        {"name": "حقول برقان والأحمدي (الكويت)", "lat": 28.9800, "lon": 47.9500, "radius_km": 35},
-        {"name": "حقول الظهران وبقيق والجبيل", "lat": 26.2500, "lon": 49.8000, "radius_km": 50},
-        {"name": "حقول دير الزور والعمر النفطية", "lat": 35.0800, "lon": 40.5600, "radius_km": 22}
+        {"name": "حقول الرميلة والقرنة (البصرة)", "lat": 30.5800, "lon": 47.3400, "radius_km": 48}
     ]
-
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-logger = logging.getLogger("OSINT-Core-v3")
+logger = logging.getLogger("OSINT-Core-v4")
 
 
 # ==========================================
-# GEOSPATIAL, COMPASS BEARING & REVERSE GEOCODER ENGINE
+# ARABIC FONT LOADER & SHAPER FOR MAP WATERMARK
+# ==========================================
+ARABIC_FONT_PATH = "/tmp/arabic_tactical_font.ttf"
+
+
+async def ensure_arabic_font(client: httpx.AsyncClient) -> Optional[str]:
+    """Ensures a valid Arabic TTF font is available for rendering the Arabic watermark on Linux."""
+    system_candidates = [
+        ARABIC_FONT_PATH,
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+    ]
+    for path in system_candidates:
+        if os.path.exists(path) and os.path.getsize(path) > 10000:
+            return path
+
+    # Download Cairo-Bold or Amiri Arabic TTF from Google Fonts GitHub if no system font exists
+    font_urls = [
+        "https://github.com/google/fonts/raw/main/ofl/cairo/static/Cairo-Bold.ttf",
+        "https://github.com/google/fonts/raw/main/ofl/tajawal/Tajawal-Bold.ttf"
+    ]
+    for url in font_urls:
+        try:
+            resp = await client.get(url, timeout=8.0)
+            if resp.status_code == 200 and len(resp.content) > 15000:
+                with open(ARABIC_FONT_PATH, "wb") as f:
+                    f.write(resp.content)
+                return ARABIC_FONT_PATH
+        except Exception:
+            continue
+    return None
+
+
+def shape_arabic_text(text: str) -> str:
+    """Shapes and applies RTL BiDi algorithm so Arabic text renders properly in Pillow."""
+    if HAS_ARABIC_SHAPER:
+        try:
+            reshaped = arabic_reshaper.reshape(text)
+            return get_display(reshaped)
+        except Exception:
+            return text
+    return text
+
+
+# ==========================================
+# GEOSPATIAL, 3-NATION OPERATOR ID & REVERSE GEOCODER
 # ==========================================
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6371.0
@@ -75,7 +143,6 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def calculate_bearing_ar(lat1: float, lon1: float, lat2: float, lon2: float) -> str:
-    """Calculates compass direction in Arabic from (lat1, lon1) to (lat2, lon2)."""
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dlon = math.radians(lon2 - lon1)
     x = math.sin(dlon) * math.cos(phi2)
@@ -93,8 +160,20 @@ def match_sector(lat: float, lon: float) -> Optional[str]:
     return None
 
 
+def identify_allowed_military_operator(hex_code: str, callsign: str) -> Optional[str]:
+    """
+    Strictly checks if an aircraft belongs to USA, Israel, or Saudi Arabia
+    using ICAO Hex prefix or military callsign prefix. Returns operator Arabic name or None.
+    """
+    hx = hex_code.strip().upper()
+    cs = callsign.strip().upper()
+    for _, op in config.ALLOWED_MILITARY_OPERATORS.items():
+        if hx.startswith(op["hex_prefixes"]) or (cs and cs != "UNKNOWN" and cs.startswith(op["callsign_prefixes"])):
+            return op["name_ar"]
+    return None
+
+
 def check_strategic_proximity(lat: float, lon: float) -> Optional[Tuple[str, float, str]]:
-    """Returns (site_name, distance_km, direction_ar) if within alert radius."""
     for site in config.STRATEGIC_SITES:
         dist = haversine_km(lat, lon, site["lat"], site["lon"])
         if dist <= site["radius_km"]:
@@ -104,7 +183,6 @@ def check_strategic_proximity(lat: float, lon: float) -> Optional[Tuple[str, flo
 
 
 def find_nearest_landmark(lat: float, lon: float) -> Tuple[str, float, str]:
-    """Always finds the closest strategic/coastal landmark and exact bearing/distance."""
     best_site = "نقطة رصد إقليمية"
     best_dist = 999999.0
     best_dir = ""
@@ -124,16 +202,10 @@ def is_known_oil_flare(lat: float, lon: float) -> bool:
     return False
 
 
-# Cache for Reverse Geocoding to avoid repetitive HTTP requests
 GEOCODE_CACHE: Dict[str, str] = {}
 
 
 async def resolve_exact_location_ar(client: httpx.AsyncClient, lat: float, lon: float) -> str:
-    """
-    Dual-Layer Tactical Reverse Geocoder:
-    Layer 1: Queries OpenStreetMap Nominatim in Arabic for exact City/Town, Province, Country.
-    Layer 2: Appends tactical bearing & distance from nearest strategic military/coastal landmark.
-    """
     cache_key = f"{lat:.2f}_{lon:.2f}"
     nearest_name, dist_km, bearing_ar = find_nearest_landmark(lat, lon)
     tactical_ref = (
@@ -147,7 +219,7 @@ async def resolve_exact_location_ar(client: httpx.AsyncClient, lat: float, lon: 
         return f"{base_loc} — ({tactical_ref})"
 
     url = f"https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat={lat}&lon={lon}&zoom=10&accept-language=ar"
-    headers = {"User-Agent": "OSINT-Tactical-Locator/3.0 (Strategic Research)"}
+    headers = {"User-Agent": "OSINT-Tactical-Locator/4.0 (Strategic Research)"}
     base_loc = ""
     try:
         resp = await client.get(url, headers=headers, timeout=4.5)
@@ -173,22 +245,23 @@ async def resolve_exact_location_ar(client: httpx.AsyncClient, lat: float, lon: 
         pass
 
     if not base_loc:
-        # Maritime or open desert fallback
         if 24.0 <= lat <= 30.5 and 48.0 <= lon <= 57.5:
             base_loc = "مياه الخليج العربي / مضيق هرمز"
         elif 11.5 <= lat <= 22.0 and 37.0 <= lon <= 44.5:
             base_loc = "المجال البحري للبحر الأحمر / باب المندب"
+        elif 11.5 <= lat <= 16.0 and 44.5 <= lon <= 53.5:
+            base_loc = "خليج عدن وبحر العرب (قبالة السواحل اليمنية)"
         elif 31.5 <= lat <= 36.5 and 31.5 <= lon <= 36.0:
             base_loc = "المجال البحري لشرق البحر المتوسط"
         else:
-            base_loc = "نطاق جغرافي مفتوح"
+            base_loc = "نطاق عمليات جوي/ميداني"
 
     GEOCODE_CACHE[cache_key] = base_loc
     return f"{base_loc} — ({tactical_ref})"
 
 
 # ==========================================
-# ULTRA-LIGHT GEMINI AI MILITARY ANALYST (ZERO-WASTE TOKENS)
+# MILITARY INTELLIGENCE SYSTEM PROMPT (SITREP / INTSUM)
 # ==========================================
 async def generate_ai_military_post(
     client: httpx.AsyncClient,
@@ -196,25 +269,32 @@ async def generate_ai_military_post(
     title: str,
     exact_location: str,
     telemetry_summary: str,
+    operator_name: Optional[str] = None,
     correlation_note: Optional[str] = None
 ) -> Optional[str]:
     """
-    Calls the fastest, lowest-token Gemini Flash-Lite model with thinkingBudget=0
-    and compact input to generate a ready-to-publish Arabic military intelligence post.
-    Automatically cascades across fallback models if needed.
+    Uses a specialized Military Intelligence Officer System Prompt (OSINT/SIGINT)
+    with Flash-Lite (thinkingBudget=0) to produce a high-precision tactical SITREP
+    linking the event to the ongoing Middle East war and the Yemen/Houthi-Legitimacy-Saudi conflict.
     """
     if not config.GEMINI_API_KEY:
         return None
 
+    op_str = f" | القوة المشغلة: {operator_name}" if operator_name else ""
     corr_str = f" | تقاطع استخباراتي: {correlation_note}" if correlation_note else ""
-    compact_prompt = (
-        "أنت محلل استخبارات عسكرية (OSINT). صغ منشوراً إخبارياً عسكرياً احترافياً ومختصراً جداً (3 إلى 4 أسطر فقط) "
-        "جاهزاً للنشر في قناة تيليجرام عاجلة بناءً على هذه البيانات الخام. "
-        "اذكر اسم المكان الدقيق بوضوح في بداية التحليل، واشرح طبيعة الطائرة ومهمتها الاستخباراتية/العملياتية أو طبيعة الانفجار/الحدث وأهميته التكتيكية بدون أي مقدمات أو حشو:\n"
-        f"التصنيف: {category} | الحدث: {title} | الموقع الدقيق: {exact_location} | البيانات: {telemetry_summary}{corr_str}"
-    )
 
-    # Deduplicate cascade list while preserving order
+    NL = chr(10)
+    military_intel_prompt = NL.join([
+        "أنت ضابط استخبارات عسكرية (OSINT/SIGINT) في غرفة عمليات متابعة الحرب الجارية في الشرق الأوسط والحرب الدائرة في اليمن بين الحوثيين وقوات الشرعية والمملكة العربية السعودية.",
+        "صغ برقية استخباراتية ميدانية مركزة (3 إلى 4 أسطر كحد أقصى) بلغة عسكرية عربية رصينة وجاهزة للنشر الفوري بدون مقدمات أو عناوين إنشائية:",
+        "1. ابدأ بذكر الحدث، القوة الجوية المشغلة (الأمريكية 🇺🇸 أو الإسرائيلية 🇮🇱 أو السعودية 🇸🇦 إن وجدت)، والموقع الجغرافي الدقيق والمسافة من أقرب قاعدة أو جبهة.",
+        "2. حلل المهمة التكتيكية في سياق العمليات العسكرية الجارية:",
+        "- إذا كان في مسرح اليمن وجنوب السعودية والبحر الأحمر (صعدة، مأرب، الحديدة، صنعاء، تعز، حرض، جازان، نجران، خميس مشيط، باب المندب): اربطه بمهام القوات الجوية السعودية والتحالف في اعتراض المسيّرات والصواريخ الباليستية الحوثية، الإسناد الجوي لقوات الشرعية على خطوط التماس، أو رصد واستهداف منصات الإطلاق الساحلية والجبلية.",
+        "- إذا كان في مسرح إيران، الشام، العراق، فلسطين، أو الخليج: اربطه بالتصعيد العسكري الإقليمي، الاستطلاع الإلكتروني ELINT/SIGINT لكشف الرادارات والدفاعات الجوية، الإنذار المبكر AWACS، إسناد المقاتلات بالوقود لتنفيذ ضربات بعيدة المدى، أو نشاط الحرب الإلكترونية (إعاقة وتشويش GPS NIC<=2).",
+        "3. اختم بسطر التقدير العملياتي لدلالة هذا الرصد على مسار المعركة.",
+        f"البيانات المرصودة -> التصنيف: {category}{op_str} | الحدث: {title} | الموقع الدقيق: {exact_location} | التفاصيل التقنية: {telemetry_summary}{corr_str}"
+    ])
+
     seen_m = set()
     models_to_try = []
     for m in config.GEMINI_MODEL_CASCADE:
@@ -225,17 +305,16 @@ async def generate_ai_military_post(
     for model_name in models_to_try:
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={config.GEMINI_API_KEY}"
         payload = {
-            "contents": [{"parts": [{"text": compact_prompt}]}],
+            "contents": [{"parts": [{"text": military_intel_prompt}]}],
             "generationConfig": {
-                "maxOutputTokens": 220,
-                "temperature": 0.25,
+                "maxOutputTokens": 240,
+                "temperature": 0.2,
                 "thinkingConfig": {"thinkingBudget": 0}
             }
         }
         try:
             resp = await client.post(api_url, json=payload, timeout=7.5)
             if resp.status_code != 200:
-                # Retry without thinkingConfig in case an older endpoint rejects the field
                 payload["generationConfig"].pop("thinkingConfig", None)
                 resp = await client.post(api_url, json=payload, timeout=7.5)
 
@@ -246,7 +325,6 @@ async def generate_ai_military_post(
                     parts = candidates[0].get("content", {}).get("parts", [])
                     if parts and parts[0].get("text"):
                         text_out = parts[0]["text"].strip()
-                        # Clean markdown asterisks to avoid breaking HTML parse_mode
                         text_out = text_out.replace("**", "").replace("*", "")
                         state.stats["ai_analyses"] += 1
                         state.stats["active_ai_model"] = model_name
@@ -259,7 +337,7 @@ async def generate_ai_military_post(
 
 
 # ==========================================
-# TACTICAL STATIC MAP GENERATOR v3 (WITH FLIGHT TRAIL & POLYGONS)
+# TACTICAL STATIC MAP GENERATOR v4 (WITH "خاص بتسريبات الحرب" WATERMARK)
 # ==========================================
 def deg2num_float(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[float, float]:
     lat_rad = math.radians(lat_deg)
@@ -299,7 +377,9 @@ async def generate_tactical_map_image(
         except Exception:
             pass
 
+    font_path_task = asyncio.create_task(ensure_arabic_font(client))
     await asyncio.gather(*(fetch_tile(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)))
+    arabic_font_path = await font_path_task
 
     px_x = int((cx - center_tile_x + 1) * 256)
     px_y = int((cy - center_tile_y + 1) * 256)
@@ -321,7 +401,7 @@ async def generate_tactical_map_image(
     for gy in range(0, h, 64):
         draw.line([(0, gy), (w, gy)], fill=(48, 209, 88, 28), width=1)
 
-    # Draw Historical Flight Trail Polyline if available
+    # Draw Historical Flight Trail Polyline
     if trail_coords and len(trail_coords) >= 2:
         pts_px = []
         for t_lat, t_lon in trail_coords:
@@ -334,7 +414,7 @@ async def generate_tactical_map_image(
             for p_x, p_y in pts_px[:-1]:
                 draw.ellipse([p_x - 3, p_y - 3, p_x + 3, p_y + 3], fill=(10, 210, 255, 180))
 
-    # EW / GPS Jamming Purple Zone Overlay
+    # EW / GPS Jamming Zone
     if is_ew_jamming:
         draw.ellipse([tx_px - 95, ty_px - 95, tx_px + 95, ty_px + 95], fill=(191, 90, 242, 70), outline=(191, 90, 242, 255), width=2)
 
@@ -364,18 +444,36 @@ async def generate_tactical_map_image(
     draw.ellipse([tx_px - 5, ty_px - 5, tx_px + 5, ty_px + 5], fill=(255, 255, 255, 255), outline=primary_color, width=2)
 
     # Top & Bottom HUD Bars
-    draw.rectangle([0, 0, w, 36], fill=(10, 12, 16, 225))
-    draw.rectangle([0, h - 32, w, h], fill=(10, 12, 16, 225))
+    draw.rectangle([0, 0, w, 36], fill=(10, 12, 16, 230))
+    draw.rectangle([0, h - 38, w, h], fill=(10, 12, 16, 235))
+    draw.line([(0, h - 38), (w, h - 38)], fill=primary_color, width=1)
 
-    font = ImageFont.load_default()
-    hud_top = f"OSINT FUSION CENTER v3 // {category} // [{severity}]"
-    hud_bottom = f"LAT: {lat:.4f} N   LON: {lon:.4f} E   ID: {label_code}   ZOOM: Z{zoom}"
-    draw.text((14, 11), hud_top, fill=primary_color, font=font)
-    draw.text((14, h - 22), hud_bottom, fill=(220, 220, 230, 255), font=font)
+    default_font = ImageFont.load_default()
+    hud_top = f"OSINT FUSION CENTER v4 // {category} // [{severity}]"
+    hud_bottom_left = f"LAT: {lat:.4f} N  LON: {lon:.4f} E  |  ID: {label_code}"
+    draw.text((14, 11), hud_top, fill=primary_color, font=default_font)
+    draw.text((14, h - 24), hud_bottom_left, fill=(215, 215, 225, 255), font=default_font)
+
+    # Draw Arabic Watermark "خاص بتسريبات الحرب" on the bottom right badge
+    watermark_raw = getattr(config, "MAP_WATERMARK_AR", "خاص بتسريبات الحرب")
+    shaped_wm = shape_arabic_text(watermark_raw)
+
+    # Tactical Red/Gold Badge on the Bottom Right
+    badge_w = 195
+    draw.rectangle([w - badge_w - 10, h - 33, w - 10, h - 5], fill=(255, 69, 58, 38), outline=primary_color, width=1)
+
+    if arabic_font_path:
+        try:
+            ar_font = ImageFont.truetype(arabic_font_path, 15)
+            draw.text((w - badge_w + 12, h - 30), shaped_wm, fill=(255, 214, 10, 255), font=ar_font)
+        except Exception:
+            draw.text((w - badge_w + 10, h - 24), "WAR LEAKS EXCLUSIVE", fill=(255, 214, 10, 255), font=default_font)
+    else:
+        draw.text((w - badge_w + 10, h - 24), "WAR LEAKS EXCLUSIVE", fill=(255, 214, 10, 255), font=default_font)
 
     combined = Image.alpha_composite(cropped, overlay).convert("RGB")
     buf = io.BytesIO()
-    combined.save(buf, format="JPEG", quality=90)
+    combined.save(buf, format="JPEG", quality=92)
     return buf.getvalue()
 
 
@@ -387,7 +485,7 @@ class StateEngine:
         self.seen_events: Dict[str, float] = {}
         self.aircraft_tracks: Dict[str, List[Tuple[float, float, float, float]]] = {}
         self.active_high_value_flights: Dict[str, dict] = {}
-        self.recent_air_presence: List[dict] = []  # For Multi-Sensor Correlation with strikes
+        self.recent_air_presence: List[dict] = []
         self.stats = {
             "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             "alerts_sent": 0,
@@ -434,30 +532,30 @@ class StateEngine:
         displacement = haversine_km(history[0][1], history[0][2], history[-1][1], history[-1][2])
         return (total_turn >= 160.0 and displacement < 90.0), trail
 
-    def log_air_activity_for_correlation(self, callsign: str, ac_type_desc: str, lat: float, lon: float):
+    def log_air_activity_for_correlation(self, callsign: str, operator_name: str, ac_type_desc: str, lat: float, lon: float):
         now = time.time()
         self.recent_air_activity_cleanup(now)
         self.recent_air_presence.append({
             "time": now,
             "callsign": callsign,
+            "operator": operator_name,
             "desc": ac_type_desc,
             "lat": lat,
             "lon": lon
         })
 
     def recent_air_activity_cleanup(self, now: float):
-        self.recent_air_presence = [item for item in self.recent_air_presence if now - item["time"] <= 5400]  # 90 mins
+        self.recent_air_presence = [item for item in self.recent_air_presence if now - item["time"] <= 5400]
 
     def check_multi_sensor_correlation(self, lat: float, lon: float) -> Optional[str]:
-        """Checks if a strike/thermal/seismic event occurred within 120 km of recent military ISR/Tanker activity."""
         now = time.time()
         self.recent_air_activity_cleanup(now)
         for air in self.recent_air_presence:
             dist = haversine_km(lat, lon, air["lat"], air["lon"])
-            if dist <= 120.0:
+            if dist <= 130.0:
                 mins_ago = int((now - air["time"]) // 60)
                 self.stats["correlated_strikes"] += 1
-                return f"تطابق رصد جوي/ميداني: رُصدت الطائرة ({air['callsign']} - {air['desc']}) على بُعد {dist:.0f} كم قبل {mins_ago} دقيقة من الحدث."
+                return f"تطابق رصد جوي/ميداني: رُصد تحليق عسكري لـ ({air['operator']} - {air['callsign']}) على بُعد {dist:.0f} كم قبل {mins_ago} دقيقة من الحدث."
         return None
 
 
@@ -482,6 +580,7 @@ async def send_telegram_alert(
     label_code: str = "OSINT",
     trail_coords: Optional[List[Tuple[float, float]]] = None,
     is_ew_jamming: bool = False,
+    operator_name: Optional[str] = None,
     correlation_note: Optional[str] = None
 ) -> Tuple[bool, str]:
     if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
@@ -489,22 +588,21 @@ async def send_telegram_alert(
         logger.warning(msg)
         return False, msg
 
-    # 1. Resolve Exact Location (City, Province, Country + Nearest Landmark Bearing)
     exact_location_str = sector_name
     if lat is not None and lon is not None:
         exact_location_str = await resolve_exact_location_ar(client, lat, lon)
 
-    # 2. Generate Ultra-Fast AI Military Briefing (if GEMINI_API_KEY is set)
     ai_post_text = await generate_ai_military_post(
         client=client,
         category=category,
         title=title,
         exact_location=exact_location_str,
         telemetry_summary=" | ".join(telemetry_lines),
+        operator_name=operator_name,
         correlation_note=correlation_note
     )
 
-    badge = "🔴 عاجل — حرج" if severity == "CRITICAL" else "🟠 رصد عسكري هام"
+    badge = "🔴 عاجل — رصد عسكري حرج" if severity == "CRITICAL" else "🟠 رصد عملياتي هام"
     if correlation_note:
         badge = "🚨 تقاطع استخباراتي مؤكد (MULTI-SENSOR)"
 
@@ -512,16 +610,18 @@ async def send_telegram_alert(
 
     msg_parts = [
         f"<b>{badge} | {category}</b>",
-        f"📍 <b>الموقع الدقيق:</b> {exact_location_str}",
-        "━━━━━━━━━━━━━━━━━━━━"
     ]
+    if operator_name:
+        msg_parts.append(f"🏳️ <b>القوة المشغلة:</b> {operator_name}")
+    msg_parts.append(f"📍 <b>الموقع الدقيق:</b> {exact_location_str}")
+    msg_parts.append("━━━━━━━━━━━━━━━━━━━━")
 
     if ai_post_text:
-        msg_parts.append(f"🧠 <b>التحليل العسكري والاستخباراتي:</b>\n{ai_post_text}")
+        msg_parts.append("🧠 <b>التقدير العسكري والاستخباراتي:</b>" + chr(10) + ai_post_text)
         msg_parts.append("")
     else:
         msg_parts.append(f"<b>الحدث المرصود:</b> {title}")
-        msg_parts.append(f"<b>القطاع العملياتي:</b> {sector_name}")
+        msg_parts.append(f"<b>المسرح العملياتي:</b> {sector_name}")
 
     if correlation_note:
         msg_parts.append(f"🔗 <b>ربط المصادر:</b> {correlation_note}")
@@ -534,10 +634,9 @@ async def send_telegram_alert(
         msg_parts.append(f"• {line}")
 
     msg_parts.append("━━━━━━━━━━━━━━━━━━━━")
-    msg_parts.append(f"⏱ <code>{now_str}</code>")
+    msg_parts.append(f"🛡 <b>خاص بتسريبات الحرب</b> | ⏱ <code>{now_str}</code>")
 
-    text = "\n".join(msg_parts)
-    # Ensure caption stays within Telegram 1024-char limit
+    text = chr(10).join(msg_parts)
     if len(text) > 1015:
         text = text[:1010] + "..."
 
@@ -584,12 +683,12 @@ async def send_telegram_alert(
             if reply_markup_json:
                 data_form["reply_markup"] = reply_markup_json
 
-            files = {"photo": ("tactical_map_v3.jpg", map_bytes, "image/jpeg")}
+            files = {"photo": ("warleaks_tactical_map.jpg", map_bytes, "image/jpeg")}
             resp = await client.post(photo_url, data=data_form, files=files, timeout=20.0)
             if resp.status_code == 200:
                 state.stats["alerts_sent"] += 1
                 state.stats["last_alert_time"] = now_str
-                return True, "تم إرسال المنشور التحليلي مع الموقع الدقيق والخريطة التكتيكية بنجاح."
+                return True, "تم إرسال المنشور الاستخباراتي مع الخريطة الموقعة بـ (خاص بتسريبات الحرب) بنجاح."
             else:
                 logger.warning(f"sendPhoto failed ({resp.status_code}), falling back to sendMessage: {resp.text}")
         except Exception as exc:
@@ -617,7 +716,7 @@ async def send_telegram_alert(
 
 
 # ==========================================
-# COLLECTOR 1: MILITARY AVIATION, EW JAMMING & GHOST MODE
+# COLLECTOR 1: EXCLUSIVE US / ISRAELI / SAUDI MILITARY AVIATION
 # ==========================================
 async def poll_military_aviation(client: httpx.AsyncClient):
     state.stats["aviation_scans"] += 1
@@ -648,9 +747,15 @@ async def poll_military_aviation(client: httpx.AsyncClient):
         if not sector_name:
             continue
 
-        hex_code = str(ac.get("hex", "")).upper()
+        hex_code = str(ac.get("hex", "")).strip().upper()
         callsign = str(ac.get("flight", "")).strip().upper() or "UNKNOWN"
         ac_type = str(ac.get("t", "")).strip().upper()
+
+        # STRICT 3-NATION FILTER: Only USA 🇺🇸, Israel 🇮🇱, or Saudi Arabia 🇸🇦 military aircraft
+        operator_name = identify_allowed_military_operator(hex_code, callsign)
+        if not operator_name:
+            continue
+
         alt_baro = ac.get("alt_baro", 0)
         gs = ac.get("gs", "N/A")
         track = float(ac.get("track", 0.0) or 0.0)
@@ -658,25 +763,19 @@ async def poll_military_aviation(client: httpx.AsyncClient):
         nic = ac.get("nic")
         nac_p = ac.get("nac_p")
 
-        # Check Live Electronic Warfare (EW / GPS Jamming) signature from raw transponder NIC/NACp degradation
         is_ew_jammed = (nic is not None and int(nic) <= 2) or (nac_p is not None and int(nac_p) <= 2)
-
         type_desc = config.HIGH_VALUE_AIRCRAFT_TYPES.get(ac_type)
-        is_strategic_callsign = callsign.startswith(config.MILITARY_CALLSIGN_PREFIXES)
         is_emergency = squawk in ("7700", "7600", "7500")
         is_orbiting, trail_coords = state.record_aircraft_heading(hex_code, lat, lon, track)
-
-        if not (type_desc or is_strategic_callsign or is_emergency or is_orbiting):
-            continue
 
         current_scan_hexes.add(hex_code)
         alt_num = int(alt_baro) if isinstance(alt_baro, (int, float)) else 25000
 
-        # Track for Ghost Mode (Sudden Transponder Drop-off at high altitude)
         state.active_high_value_flights[hex_code] = {
             "last_seen": now,
             "callsign": callsign,
-            "desc": type_desc or ac_type,
+            "operator": operator_name,
+            "desc": type_desc or f"طائرة عسكرية ({ac_type or 'غير مصنف'})",
             "lat": lat,
             "lon": lon,
             "alt": alt_num,
@@ -685,30 +784,29 @@ async def poll_military_aviation(client: httpx.AsyncClient):
             "trail": trail_coords
         }
 
-        # Log for Multi-Sensor Correlation with thermal/seismic strikes
-        state.log_air_activity_for_correlation(callsign, type_desc or ac_type, lat, lon)
+        state.log_air_activity_for_correlation(callsign, operator_name, type_desc or ac_type, lat, lon)
 
         if is_ew_jammed:
             state.stats["ew_jamming_events"] += 1
 
-        severity = "CRITICAL" if (is_orbiting or is_emergency or is_ew_jammed or ac_type in ("R135", "E3CF", "E3TF", "B52", "B1", "RQ4")) else "HIGH"
+        severity = "CRITICAL" if (is_orbiting or is_emergency or is_ew_jammed or type_desc is not None) else "HIGH"
         dedup_suffix = "ORBIT" if is_orbiting else ("EW" if is_ew_jammed else "DETECT")
         if state.is_duplicate(f"AIR_{hex_code}_{dedup_suffix}", ttl_seconds=7200):
             continue
 
-        pattern_note = "🔄 مدار دائري نشط (Orbit/Racetrack)" if is_orbiting else "عبور / دورية استطلاع نشطة"
+        pattern_note = "🔄 مدار عملياتي مستمر (Orbit/Loitering)" if is_orbiting else "تحليق / دورية عملياتية نشطة"
         if is_ew_jammed:
-            pattern_note += " | ⚡ تعرض لتشويش حرب إلكترونية (GPS Jamming NIC<=2)"
+            pattern_note += " | ⚡ رصد تشويش حرب إلكترونية (GPS Jamming NIC<=2)"
 
-        title = type_desc if type_desc else f"طائرة عسكرية خاصة ({ac_type or 'غير مصنف'})"
+        title = type_desc if type_desc else f"طائرة عسكرية ({ac_type or 'مهام خاصة'})"
         if is_orbiting:
-            title = f"مدار عملياتي مستمر: {title}"
+            title = f"مدار عملياتي نشط: {title}"
 
         telemetry = [
-            f"النداء (Callsign): <code>{callsign}</code> | ICAO: <code>{hex_code}</code>",
+            f"النداء اللاسلكي: <code>{callsign}</code> | كود ICAO: <code>{hex_code}</code>",
             f"الطراز: <code>{ac_type or 'N/A'}</code> | الارتفاع: <code>{alt_baro} ft</code>",
             f"السرعة: <code>{gs} kt</code> | الاتجاه: <code>{track}°</code>",
-            f"الحالة التكتيكية: {pattern_note}"
+            f"النمط التكتيكي: {pattern_note}"
         ]
 
         adsb_url = f"https://globe.adsbexchange.com/?icao={hex_code.lower()}"
@@ -717,7 +815,7 @@ async def poll_military_aviation(client: httpx.AsyncClient):
         await send_telegram_alert(
             client=client,
             severity=severity,
-            category="MILITARY AVIATION & EW SIGINT",
+            category="MILITARY AVIATION & SIGINT",
             title=title,
             sector_name=sector_name,
             lat=lat,
@@ -726,17 +824,17 @@ async def poll_military_aviation(client: httpx.AsyncClient):
             extra_links=[("✈️ ADS-B Exchange", adsb_url), ("📡 ACARS Feed", airframes_url)],
             heading=track,
             is_orbiting=is_orbiting,
-            label_code=callsign,
+            label_code=callsign if callsign != "UNKNOWN" else hex_code,
             trail_coords=trail_coords,
-            is_ew_jamming=is_ew_jammed
+            is_ew_jamming=is_ew_jammed,
+            operator_name=operator_name
         )
 
-    # Check Ghost Mode: High-altitude aircraft that suddenly turned off transponder mid-air
+    # Check Ghost Mode for US/Israeli/Saudi aircraft turning off transponders at high altitude
     expired_hexes = []
     for hx, info in state.active_high_value_flights.items():
         if hx not in current_scan_hexes and (now - info["last_seen"]) >= 320:
             expired_hexes.append(hx)
-            # Alert only if aircraft was cruising high (>16,000 ft) when it vanished (not landing)
             if info["alt"] >= 16000 and not state.is_duplicate(f"GHOST_{hx}", ttl_seconds=14400):
                 await send_telegram_alert(
                     client=client,
@@ -748,13 +846,14 @@ async def poll_military_aviation(client: httpx.AsyncClient):
                     lon=info["lon"],
                     telemetry_lines=[
                         f"النداء اللاسلكي: <code>{info['callsign']}</code> | ICAO: <code>{hx}</code>",
-                        f"آخر ارتفاع قبل الاختفاء: <code>{info['alt']} ft (تحليق عالي)</code>",
-                        f"آخر اتجاه مسجل: <code>{info['track']}°</code>",
-                        "التفسير التكتيكي: إغلاق متعمد للبث الراداري (Transponder Off) لدخول منطقة عمليات"
+                        f"آخر ارتفاع مسجل قبل الإظلام: <code>{info['alt']} ft</code>",
+                        f"آخر اتجاه: <code>{info['track']}°</code>",
+                        "التفسير التكتيكي: إغلاق متعمد للبث الراداري لدخول منطقة عمليات"
                     ],
                     heading=info["track"],
                     label_code=f"DARK-{info['callsign']}",
-                    trail_coords=info["trail"]
+                    trail_coords=info["trail"],
+                    operator_name=info["operator"]
                 )
 
     for hx in expired_hexes:
@@ -813,17 +912,17 @@ async def poll_seismic_anomalies(client: httpx.AsyncClient):
 
         if is_explicit_blast or (depth_km <= 2.5 and prox is not None) or correlation:
             severity = "CRITICAL"
-            title = f"بصمة انفجار سطحي / ارتجاج تكتيكي ({mag}M)"
+            title = f"بصمة انفجار سطحي / استهداف تكتيكي ({mag}M)"
         elif is_shallow:
             severity = "CRITICAL"
-            title = f"حدث زلزالي سطحي ضحل جداً (احتمال انفجار ضخم أو ضربة للتحصينات - {mag}M)"
+            title = f"حدث زلزالي سطحي ضحل جداً (احتمال انفجار مستودعات أو ضربة تحصينات - {mag}M)"
         else:
             severity = "HIGH"
-            title = f"نشاط زلزالي قرب منطقة استراتيجية ({mag}M)"
+            title = f"نشاط زلزالي قرب موقع عسكري/استراتيجي ({mag}M)"
 
         event_dt = datetime.fromtimestamp(event_time_ms / 1000.0, tz=timezone.utc).strftime("%H:%M:%S UTC")
         telemetry = [
-            f"القوة المسجلة: <code>{mag} ريختر</code> | العمق: <code>{depth_km:.1f} كم</code> {'⚠️ (سطحي)' if is_shallow else ''}",
+            f"القوة المسجلة: <code>{mag} ريختر</code> | العمق: <code>{depth_km:.1f} كم</code> {'⚠️ (سطحي/ضحل)' if is_shallow else ''}",
             f"التصنيف الموجي الخام: <code>{event_type.upper()}</code>",
             f"وقت التسجيل (UTC): <code>{event_dt}</code>"
         ]
@@ -908,16 +1007,16 @@ async def poll_thermal_anomalies(client: httpx.AsyncClient):
         severity = "CRITICAL" if is_critical else "HIGH"
 
         if cluster_count >= 3:
-            title = f"شذوذ حراري عنقودي ({cluster_count} بؤر متقاربة - مؤشر قصف مكثف أو غارة)"
+            title = f"شذوذ حراري عنقودي ({cluster_count} بؤر متقاربة - مؤشر قصف مكثف أو غارة جوية)"
         elif item["prox"] is not None:
-            title = f"بصمة حرارية / انفجار بجوار منشأة عسكرية حساسة ({item['frp']} MW)"
+            title = f"بصمة حرارية / استهداف ناري بجوار موقع عسكري أو جبهة ({item['frp']} MW)"
         else:
             title = f"شذوذ حراري عالي الطاقة مرصود بالأقمار الصناعية ({item['frp']} MW)"
 
         telemetry = [
-            f"الطاقة الإشعاعية (FRP): <code>{item['frp']} MW</code> | البؤر المتقاربة: <code>{cluster_count}</code>",
+            f"الطاقة الإشعاعية (FRP): <code>{item['frp']} MW</code> | البؤر المشتعلة: <code>{cluster_count}</code>",
             f"التوقيت الفضائي: <code>{item['acq_date']} {item['acq_time']} UTC</code> ({'ليلي 🌙' if item['daynight']=='N' else 'نهاري ☀️'})",
-            f"المستشعر: <code>VIIRS S-NPP Infrared</code>"
+            f"المستشعر الفضائي: <code>VIIRS S-NPP Infrared</code>"
         ]
 
         await send_telegram_alert(
@@ -990,7 +1089,7 @@ async def poll_nga_warnings(client: httpx.AsyncClient):
         me_regions = (
             "PERSIAN GULF", "RED SEA", "ARABIAN SEA", "GULF OF OMAN",
             "GULF OF ADEN", "EASTERN MEDITERRANEAN", "STRAIT OF HORMUZ",
-            "BAB EL MANDEB", "ISRAEL", "LEBANON", "SYRIA", "IRAN", "YEMEN", "CYPRUS"
+            "BAB EL MANDEB", "ISRAEL", "LEBANON", "SYRIA", "IRAN", "YEMEN", "CYPRUS", "SAUDI"
         )
         in_me_text = any(r in text for r in me_regions) or subregion in ("62", "63", "26")
 
@@ -1005,7 +1104,7 @@ async def poll_nga_warnings(client: httpx.AsyncClient):
             continue
 
         if not sector_name:
-            sector_name = "المجال البحري والجوي للشرق الأوسط (NAVAREA)"
+            sector_name = "المجال البحري والجوي للشرق الأوسط والبحر الأحمر (NAVAREA)"
 
         dedup_key = f"NGA_{nav_area}_{msg_year}_{msg_num}"
         if state.is_duplicate(dedup_key, ttl_seconds=86400 * 7):
@@ -1042,9 +1141,9 @@ async def poll_nga_warnings(client: httpx.AsyncClient):
 # BACKGROUND ORCHESTRATOR LOOP
 # ==========================================
 async def osint_scheduler_loop():
-    logger.info("Starting Autonomous OSINT Fusion Center v3...")
+    logger.info("Starting Autonomous OSINT Fusion Center v4 (WarLeaks Edition)...")
     headers = {
-        "User-Agent": "OSINT-Telemetry-Monitor/3.0 (Strategic Research; +https://github.com)"
+        "User-Agent": "OSINT-Telemetry-Monitor/4.0 (Strategic Research; +https://github.com)"
     }
     async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
         last_aviation = 0.0
@@ -1085,16 +1184,16 @@ async def lifespan(app: FastAPI):
 
 
 # ==========================================
-# FASTAPI SERVER & INTERACTIVE TEST DASHBOARD v3
+# FASTAPI SERVER & INTERACTIVE TEST DASHBOARD v4
 # ==========================================
-app = FastAPI(title="OSINT Strategic Fusion Center v3", lifespan=lifespan)
+app = FastAPI(title="OSINT Strategic Fusion Center v4 - WarLeaks", lifespan=lifespan)
 
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "operational",
-        "version": "v3.0 - AI Analyst + Exact Reverse Geocoder + Multi-Sensor Correlation + EW Jamming",
+        "version": "v4.0 - Exclusive US/IL/SA Aviation + Yemen/ME War Context + WarLeaks Watermark",
         "stats": state.stats,
         "cached_events": len(state.seen_events)
     }
@@ -1104,62 +1203,89 @@ async def health_check():
 async def trigger_test_alert(request: Request):
     """
     Triggers an immediate simulated OSINT alert with:
-    1. Exact City/Province/Landmark Reverse Geocoding
-    2. Ultra-Fast Gemini Flash-Lite Military Analysis Post
-    3. Multi-Sensor Correlation & Flight Trail Tactical Map
+    - Arabic Watermark "خاص بتسريبات الحرب" on the Tactical Map
+    - Military Intelligence SITREP Prompt (Yemen/Saudi/Houthi or Iran/ME War)
     """
     try:
         body = await request.json()
-        test_type = body.get("type", "aviation")
+        test_type = body.get("type", "saudi_yemen")
     except Exception:
-        test_type = "aviation"
+        test_type = "saudi_yemen"
 
-    headers = {"User-Agent": "OSINT-Telemetry-Monitor/3.0"}
+    headers = {"User-Agent": "OSINT-Telemetry-Monitor/4.0"}
     async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
-        if test_type == "thermal":
-            ok, msg = await send_telegram_alert(
-                client=client,
-                severity="CRITICAL",
-                category="TEST SIMULATION | KINETIC & THERMAL STRIKE",
-                title="رصد شذوذ حراري عنقودي عالي الطاقة (3 بؤر متقاربة)",
-                sector_name="العمق الإيراني والخليج العربي",
-                lat=32.7508,
-                lon=51.8613,
-                telemetry_lines=[
-                    "الطاقة الإشعاعية (FRP): <code>84.6 MW (بصمة انفجار عالي الطاقة)</code>",
-                    "المستشعر الفضائي: <code>VIIRS S-NPP Infrared</code>",
-                    "فلتر حقول النفط: <code>خارج نطاق المصافي والشعلات النفطية</code>"
-                ],
-                label_code="STRIKE-FRP",
-                correlation_note="تطابق رصد جوي/ميداني: رُصدت طائرة استطلاع إلكتروني على بُعد 95 كم قبل 22 دقيقة من الانفجار."
-            )
-        else:
-            # Simulated flight trail points around Strait of Hormuz / Qeshm Island
+        if test_type == "saudi_yemen":
             sample_trail = [
-                (26.3500, 56.3000),
-                (26.4800, 56.1200),
-                (26.5800, 55.9800),
-                (26.6500, 55.9000)
+                (17.9500, 43.1000),
+                (17.6500, 43.3500),
+                (17.3500, 43.5500),
+                (17.1200, 43.7200)
             ]
             ok, msg = await send_telegram_alert(
                 client=client,
                 severity="CRITICAL",
-                category="TEST SIMULATION | MILITARY AVIATION & EW",
-                title="طائرة استطلاع إلكتروني استراتيجي RC-135V Rivet Joint (مدار نشط + رصد تشويش)",
-                sector_name="العمق الإيراني والخليج العربي",
-                lat=26.6500,
-                lon=55.9000,
+                category="MILITARY AVIATION & SIGINT",
+                title="مدار عملياتي نشط: طائرة إنذار مبكر وقيادة جوية E-3 Sentry AWACS",
+                sector_name="مسرح عمليات اليمن والحدود الجنوبية السعودية والبحر الأحمر",
+                lat=17.1200,
+                lon=43.7200,
                 telemetry_lines=[
-                    "النداء (Callsign): <code>HOMER71</code> | ICAO: <code>AE01CE</code>",
-                    "الارتفاع: <code>34,500 ft</code> | السرعة: <code>412 kt</code> | الاتجاه: <code>285°</code>",
-                    "الحالة التكتيكية: 🔄 مدار دائري نشط + ⚡ رصد تشويش حرب إلكترونية (GPS Jamming)"
+                    "النداء اللاسلكي: <code>RSAF18</code> | كود ICAO: <code>7102A4</code>",
+                    "الطراز: <code>E3TF (AWACS)</code> | الارتفاع: <code>31,000 ft</code>",
+                    "السرعة: <code>385 kt</code> | الاتجاه: <code>195°</code>",
+                    "النمط التكتيكي: 🔄 مدار عملياتي مستمر لمراقبة الأجواء الحدودية وجبهتي صعدة ومأرب"
                 ],
-                extra_links=[("✈️ ADS-B Exchange Live", "https://globe.adsbexchange.com/")],
-                heading=285.0,
+                extra_links=[("✈️ ADS-B Exchange Live", "https://globe.adsbexchange.com/?icao=7102a4")],
+                heading=195.0,
                 is_orbiting=True,
-                label_code="HOMER71",
+                label_code="RSAF18",
                 trail_coords=sample_trail,
-                is_ew_jamming=True
+                operator_name="القوات الجوية الملكية السعودية 🇸🇦 (RSAF)"
+            )
+        elif test_type == "thermal":
+            ok, msg = await send_telegram_alert(
+                client=client,
+                severity="CRITICAL",
+                category="THERMAL STRIKE / FIRMS SIGNATURE",
+                title="شذوذ حراري عنقودي (4 بؤر متقاربة - مؤشر قصف مكثف أو غارة جوية)",
+                sector_name="مسرح عمليات اليمن والحدود الجنوبية السعودية والبحر الأحمر",
+                lat=15.4850,
+                lon=45.2800,
+                telemetry_lines=[
+                    "الطاقة الإشعاعية (FRP): <code>92.4 MW (انفجارات عالية الطاقة)</code>",
+                    "المستشعر الفضائي: <code>VIIRS S-NPP Infrared</code>",
+                    "فلتر الحقول النفطية: <code>خارج نطاق شعلات صافر الروتينية</code>"
+                ],
+                label_code="MARIB-FRP",
+                correlation_note="تطابق رصد جوي/ميداني: رُصد تحليق عسكري لـ (القوات الجوية الملكية السعودية 🇸🇦 - RSAF) على بُعد 75 كم قبل 18 دقيقة من الحدث."
+            )
+        else:
+            sample_trail = [
+                (32.1000, 34.1500),
+                (32.4500, 34.3000),
+                (32.8500, 34.5000),
+                (33.1500, 34.6500)
+            ]
+            ok, msg = await send_telegram_alert(
+                client=client,
+                severity="CRITICAL",
+                category="MILITARY AVIATION & EW SIGINT",
+                title="مدار عملياتي نشط: Gulfstream G550 Nachshon/Oron (استطلاع راداري وإنذار مبكر)",
+                sector_name="جبهة بلاد الشام وشرق المتوسط وفلسطين",
+                lat=33.1500,
+                lon=34.6500,
+                telemetry_lines=[
+                    "النداء اللاسلكي: <code>IAF224</code> | كود ICAO: <code>738A54</code>",
+                    "الطراز: <code>GLF5 (Nachshon)</code> | الارتفاع: <code>41,000 ft</code>",
+                    "النمط التكتيكي: 🔄 مدار مسح راداري مستمر + ⚡ تشويش حرب إلكترونية (GPS Jamming NIC<=2)"
+                ],
+                extra_links=[("✈️ ADS-B Exchange Live", "https://globe.adsbexchange.com/?icao=738a54")],
+                heading=35.0,
+                is_orbiting=True,
+                label_code="IAF224",
+                trail_coords=sample_trail,
+                is_ew_jamming=True,
+                operator_name="سلاح الجو الإسرائيلي 🇮🇱 (IAF)"
             )
 
     return JSONResponse({"ok": ok, "message": msg})
@@ -1177,7 +1303,7 @@ async def status_dashboard():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OSINT Fusion Center v3</title>
+    <title>OSINT Fusion v4 — خاص بتسريبات الحرب</title>
     <style>
         :root {{
             --bg: #0a0a0c;
@@ -1187,7 +1313,7 @@ async def status_dashboard():
             --muted: #86868b;
             --accent: #30d158;
             --primary: #0a84ff;
-            --purple: #bf5af2;
+            --gold: #ffd60a;
             --danger: #ff453a;
         }}
         * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -1203,7 +1329,7 @@ async def status_dashboard():
         }}
         .container {{
             width: 100%;
-            max-width: 800px;
+            max-width: 820px;
             background: var(--card);
             border: 1px solid var(--border);
             border-radius: 22px;
@@ -1291,14 +1417,14 @@ async def status_dashboard():
         }}
         .btn-group {{
             display: flex;
-            gap: 12px;
+            gap: 10px;
             flex-wrap: wrap;
         }}
         .btn {{
             cursor: pointer;
             border: none;
             border-radius: 10px;
-            padding: 11px 18px;
+            padding: 11px 16px;
             font-size: 13px;
             font-weight: 600;
             color: #fff;
@@ -1308,9 +1434,8 @@ async def status_dashboard():
             align-items: center;
             gap: 8px;
         }}
-        .btn.secondary {{
-            background: var(--danger);
-        }}
+        .btn.saudi {{ background: #1f8b4c; }}
+        .btn.secondary {{ background: var(--danger); }}
         .btn:active {{ transform: scale(0.98); }}
         .btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
         #test-status {{
@@ -1337,8 +1462,8 @@ async def status_dashboard():
     <div class="container">
         <div class="header">
             <div class="title-group">
-                <h1>غرفة العمليات والاستخبارات الآلية (OSINT Fusion v3)</h1>
-                <p>تحديد المدن والمعالم الدقيق + محلل Gemini Flash-Lite + ربط المصادر + رصد التشويش</p>
+                <h1>غرفة عمليات تسريبات الحرب (OSINT Fusion v4)</h1>
+                <p>رصد حصري للطيران (الأمريكي 🇺🇸 / الإسرائيلي 🇮🇱 / السعودي 🇸🇦) + جبهات اليمن والشرق الأوسط</p>
             </div>
             <div class="badge">
                 <span class="dot"></span>
@@ -1352,7 +1477,7 @@ async def status_dashboard():
                 <strong>{state.stats["alerts_sent"]}</strong>
             </div>
             <div class="metric">
-                <span>تحليلات الذكاء الاصطناعي</span>
+                <span>التقارير الاستخباراتية (AI)</span>
                 <strong>{state.stats["ai_analyses"]}</strong>
             </div>
             <div class="metric">
@@ -1364,27 +1489,31 @@ async def status_dashboard():
                 <strong>{state.stats["ew_jamming_events"]}</strong>
             </div>
             <div class="metric">
-                <span>مسح الطيران والرادار</span>
+                <span>مسح الرادار الجوي</span>
                 <strong>{state.stats["aviation_scans"]}</strong>
             </div>
         </div>
 
         <div class="test-panel">
-            <h3>⚡ لوحة التجربة الفورية (AI Analyst + Exact Location + Tactical Map)</h3>
-            <p>اضغط لاختبار الجيل الثالث: سيقوم البوت باستخراج <b>اسم المدينة والمحافظة والمسافة من أقرب قاعدة</b>، وتمريرها لنموذج <b>Flash-Lite</b> لصياغة منشور تحليلي عسكري، ورسم مسار الطائرة ونطاق التشويش على الخريطة:</p>
+            <h3>⚡ لوحة التجربة الفورية (مع توقيع "خاص بتسريبات الحرب" على الخريطة)</h3>
+            <p>اختبر الآن البرومبت الاستخباراتي العسكري الجديد وتوقيع الخريطة في مسرح اليمن والحدود السعودية أو جبهة شرق المتوسط:</p>
             <div class="btn-group">
-                <button class="btn" id="btn-air" onclick="sendTest('aviation')">
-                    ✈️ تجربة منشور استطلاع جوي + تشويش حرب إلكترونية
+                <button class="btn saudi" id="btn-sa" onclick="sendTest('saudi_yemen')">
+                    🇸🇦 تجربة طيران إنذار مبكر سعودي (جبهة صعدة/اليمن)
                 </button>
-                <button class="btn secondary" id="btn-thermal" onclick="sendTest('thermal')">
-                    🚨 تجربة منشور ضربة حرارية + تقاطع استخباراتي
+                <button class="btn secondary" id="btn-th" onclick="sendTest('thermal')">
+                    🔥 تجربة قصف حراري وتقاطع استخباراتي (جبهة مأرب)
+                </button>
+                <button class="btn" id="btn-il" onclick="sendTest(' aviation_il')">
+                    🇮🇱 تجربة استطلاع وتشويش إلكتروني (شرق المتوسط)
                 </button>
             </div>
             <div id="test-status"></div>
         </div>
 
         <div class="footer">
-            <span>المحلل الذكي: {ai_badge}</span>
+            <span>المحلل الاستخباراتي: {ai_badge}</span>
+            <span>التوقيع المدمج: خاص بتسريبات الحرب</span>
             <span>آخر منشور: {state.stats["last_alert_time"]}</span>
         </div>
     </div>
@@ -1392,27 +1521,25 @@ async def status_dashboard():
     <script>
         async function sendTest(type) {{
             const statusBox = document.getElementById('test-status');
-            const btnAir = document.getElementById('btn-air');
-            const btnThermal = document.getElementById('btn-thermal');
-            btnAir.disabled = true;
-            btnThermal.disabled = true;
+            const btns = document.querySelectorAll('.btn');
+            btns.forEach(b => b.disabled = true);
 
             statusBox.style.display = 'block';
             statusBox.style.background = 'rgba(255,255,255,0.06)';
             statusBox.style.color = '#f5f5f7';
-            statusBox.innerText = '⏳ جاري تحديد الموقع الجغرافي الدقيق، صياغة التحليل العسكري عبر Flash-Lite، ورسم الخريطة التكتيكية...';
+            statusBox.innerText = '⏳ جاري رسم الخريطة التكتيكية بتوقيع (خاص بتسريبات الحرب) وصياغة البرقية الاستخباراتية...';
 
             try {{
                 const res = await fetch('/api/test-alert', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ type }})
+                    body: JSON.stringify({{ type: type.trim() }})
                 }});
                 const data = await res.json();
                 if (data.ok) {{
                     statusBox.style.background = 'rgba(48, 209, 88, 0.15)';
                     statusBox.style.color = '#30d158';
-                    statusBox.innerText = '✅ ' + data.message + ' تفقد تيليجرام الآن!';
+                    statusBox.innerText = '✅ ' + data.message + ' تفقد قناتك الآن!';
                 }} else {{
                     statusBox.style.background = 'rgba(255, 69, 58, 0.15)';
                     statusBox.style.color = '#ff453a';
@@ -1423,8 +1550,7 @@ async def status_dashboard():
                 statusBox.style.color = '#ff453a';
                 statusBox.innerText = '❌ حدث خطأ في الشبكة: ' + err;
             }} finally {{
-                btnAir.disabled = false;
-                btnThermal.disabled = false;
+                btns.forEach(b => b.disabled = false);
             }}
         }}
     </script>
