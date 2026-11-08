@@ -1,4 +1,5 @@
 import os
+import html
 import asyncio
 import csv
 import io
@@ -374,7 +375,9 @@ async def generate_ai_military_post(
                     parts = candidates[0].get("content", {}).get("parts", [])
                     if parts and parts[0].get("text"):
                         text_out = parts[0]["text"].strip()
-                        text_out = text_out.replace("**", "").replace("*", "")
+                        text_out = re.sub(r"<[^>]+>", "", text_out)
+                        text_out = text_out.replace("**", "").replace("*", "").replace("#", "")
+                        text_out = html.escape(text_out)
                         state.stats["ai_analyses"] += 1
                         state.stats["active_ai_model"] = model_name
                         return text_out
@@ -662,10 +665,12 @@ async def send_telegram_alert(
     ]
     if operator_name:
         msg_parts.append(f"🏳️ <b>القوة المشغلة:</b> {operator_name}")
-    msg_parts.append(f"📍 <b>الموقع الدقيق:</b> {exact_location_str}")
+    msg_parts.append(f"📍 <b>الموقع الدقيق:</b> {html.escape(exact_location_str)}")
     msg_parts.append("━━━━━━━━━━━━━━━━━━━━")
 
     if ai_post_text:
+        if len(ai_post_text) > 420:
+            ai_post_text = ai_post_text[:415].rsplit(" ", 1)[0] + "..."
         msg_parts.append("🧠 <b>التقدير العسكري والاستخباراتي:</b>" + chr(10) + ai_post_text)
         msg_parts.append("")
     else:
@@ -686,8 +691,6 @@ async def send_telegram_alert(
     msg_parts.append(f"🛡 <b>خاص بتسريبات الحرب</b> | ⏱ <code>{now_str}</code>")
 
     text = chr(10).join(msg_parts)
-    if len(text) > 1015:
-        text = text[:1010] + "..."
 
     inline_keyboard = []
     if lat is not None and lon is not None:
