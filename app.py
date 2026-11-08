@@ -17,12 +17,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image, ImageDraw, ImageFont
 
-try:
-    import arabic_reshaper
-    from bidi.algorithm import get_display
-    HAS_ARABIC_SHAPER = True
-except ImportError:
-    HAS_ARABIC_SHAPER = False
+# Pure Python Zero-Dependency Arabic Shaper Built-in
 
 import config
 
@@ -119,15 +114,69 @@ async def ensure_arabic_font(client: httpx.AsyncClient) -> Optional[str]:
     return None
 
 
+ARABIC_FORMS = {
+    '\u0621': ('\uFE80', '\uFE80', '\uFE80', '\uFE80'),
+    '\u0622': ('\uFE81', '\uFE82', '\uFE81', '\uFE82'),
+    '\u0623': ('\uFE83', '\uFE84', '\uFE83', '\uFE84'),
+    '\u0624': ('\uFE85', '\uFE86', '\uFE85', '\uFE86'),
+    '\u0625': ('\uFE87', '\uFE88', '\uFE87', '\uFE88'),
+    '\u0626': ('\uFE89', '\uFE8A', '\uFE8B', '\uFE8C'),
+    '\u0627': ('\uFE8D', '\uFE8E', '\uFE8D', '\uFE8E'),
+    '\u0628': ('\uFE8F', '\uFE90', '\uFE91', '\uFE92'),
+    '\u0629': ('\uFE93', '\uFE94', '\uFE93', '\uFE94'),
+    '\u062A': ('\uFE95', '\uFE96', '\uFE97', '\uFE98'),
+    '\u062B': ('\uFE99', '\uFE9A', '\uFE9B', '\uFE9C'),
+    '\u062C': ('\uFE9D', '\uFE9E', '\uFE9F', '\uFEA0'),
+    '\u062D': ('\uFEA1', '\uFEA2', '\uFEA3', '\uFEA4'),
+    '\u062E': ('\uFEA5', '\uFEA6', '\uFEA7', '\uFEA8'),
+    '\u062F': ('\uFEA9', '\uFEAA', '\uFEA9', '\uFEAA'),
+    '\u0630': ('\uFEAB', '\uFEAC', '\uFEAB', '\uFEAC'),
+    '\u0631': ('\uFEAD', '\uFEAE', '\uFEAD', '\uFEAE'),
+    '\u0632': ('\uFEAF', '\uFEB0', '\uFEAF', '\uFEB0'),
+    '\u0633': ('\uFEB1', '\uFEB2', '\uFEB3', '\uFEB4'),
+    '\u0634': ('\uFEB5', '\uFEB6', '\uFEB7', '\uFEB8'),
+    '\u0635': ('\uFEB9', '\uFEBA', '\uFEBB', '\uFEBC'),
+    '\u0636': ('\uFEBD', '\uFEBE', '\uFEBF', '\uFEC0'),
+    '\u0637': ('\uFEC1', '\uFEC2', '\uFEC3', '\uFEC4'),
+    '\u0638': ('\uFEC5', '\uFEC6', '\uFEC7', '\uFEC8'),
+    '\u0639': ('\uFEC9', '\uFECA', '\uFECB', '\uFECC'),
+    '\u063A': ('\uFECD', '\uFECE', '\uFECF', '\uFED0'),
+    '\u0641': ('\uFED1', '\uFED2', '\uFED3', '\uFED4'),
+    '\u0642': ('\uFED5', '\uFED6', '\uFED7', '\uFED8'),
+    '\u0643': ('\uFED9', '\uFEDA', '\uFEDB', '\uFEDC'),
+    '\u0644': ('\uFEDD', '\uFEDE', '\uFEDF', '\uFEE0'),
+    '\u0645': ('\uFEE1', '\uFEE2', '\uFEE3', '\uFEE4'),
+    '\u0646': ('\uFEE5', '\uFEE6', '\uFEE7', '\uFEE8'),
+    '\u0647': ('\uFEE9', '\uFEEA', '\uFEEB', '\uFEEC'),
+    '\u0648': ('\uFEED', '\uFEEE', '\uFEED', '\uFEEE'),
+    '\u0649': ('\uFEEF', '\uFEF0', '\uFEEF', '\uFEF0'),
+    '\u064A': ('\uFEF1', '\uFEF2', '\uFEF3', '\uFEF4'),
+}
+NON_CONNECTING_NEXT = {'\u0621', '\u0622', '\u0623', '\u0624', '\u0625', '\u0627', '\u0629', '\u062F', '\u0630', '\u0631', '\u0632', '\u0648', '\u0649'}
+
+
 def shape_arabic_text(text: str) -> str:
-    """Shapes and applies RTL BiDi algorithm so Arabic text renders properly in Pillow."""
-    if HAS_ARABIC_SHAPER:
-        try:
-            reshaped = arabic_reshaper.reshape(text)
-            return get_display(reshaped)
-        except Exception:
-            return text
-    return text
+    """Pure Python Arabic glyph shaper and RTL BiDi converter (Zero external dependencies)."""
+    res = []
+    n = len(text)
+    for i, ch in enumerate(text):
+        if ch not in ARABIC_FORMS:
+            res.append(ch)
+            continue
+        prev_ch = text[i - 1] if i > 0 else None
+        next_ch = text[i + 1] if i + 1 < n else None
+        connects_prev = (prev_ch in ARABIC_FORMS) and (prev_ch not in NON_CONNECTING_NEXT)
+        connects_next = (next_ch in ARABIC_FORMS) and (ch not in NON_CONNECTING_NEXT)
+        forms = ARABIC_FORMS[ch]
+        if connects_prev and connects_next:
+            res.append(forms[3])
+        elif connects_prev and not connects_next:
+            res.append(forms[1])
+        elif not connects_prev and connects_next:
+            res.append(forms[2])
+        else:
+            res.append(forms[0])
+    return "".join(reversed(res))
 
 
 # ==========================================
